@@ -21,6 +21,7 @@ from app.repositories import (
     list_active_chats,
     list_recent_jobs,
     queue_stats,
+    recover_processing_jobs,
 )
 from app.services.claude import ClaudeClient
 from app.services.downloader import ReelDownloader
@@ -260,6 +261,9 @@ def create_app() -> FastAPI:
     async def lifespan(_app: FastAPI):
         await db.connect_db()
         await db.init_schema()
+        recovered = await recover_processing_jobs()
+        if recovered:
+            LOGGER.warning('Recovered %s stale processing jobs after restart', recovered)
 
         if settings.app_base_url.strip():
             await telegram.set_webhook(settings.webhook_url)

@@ -309,3 +309,21 @@ async def last_poll_summary() -> dict[str, Any] | None:
         'started_at': row['started_at'].isoformat() if row['started_at'] else None,
         'completed_at': row['completed_at'].isoformat() if row['completed_at'] else None,
     }
+
+
+async def recover_processing_jobs() -> int:
+    result = await db.execute(
+        """
+        update jobs
+        set status = 'pending',
+            next_attempt_at = now(),
+            updated_at = now(),
+            last_error = coalesce(last_error, 'Recovered after deploy restart')
+        where status = 'processing'
+        """
+    )
+    # asyncpg returns strings like "UPDATE 3"
+    try:
+        return int(result.split()[-1])
+    except Exception:
+        return 0
