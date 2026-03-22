@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 from app import db
@@ -72,7 +73,7 @@ async def enqueue_job(reel_url: str, trigger_source: str, max_attempts: int, pay
             reel_url,
             trigger_source,
             max_attempts,
-            payload,
+            json.dumps(payload),
         )
         return True
     except Exception as exc:
