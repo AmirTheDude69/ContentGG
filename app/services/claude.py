@@ -23,11 +23,16 @@ class ClaudeClient:
         self._style_guide_text = style_guide_text
 
     async def analyze_video(self, video_path: Path, reel_url: str) -> ClaudeAnalysisResult:
+        # Large videos can exceed Anthropic payload limits when sent as base64 video blocks.
+        # In that case we fallback to keyframe analysis.
+        if video_path.stat().st_size > 18 * 1024 * 1024:
+            return await self._analyze_with_keyframes(video_path, reel_url)
+
         try:
             return await self._analyze_with_video_input(video_path, reel_url)
         except ClaudeAnalysisError as exc:
-            # Anthropic may reject video content blocks for some accounts/models.
-            if _is_unsupported_video_input_error(str(exc)):
+            # Anthropic may reject video blocks or payload size for some reels/accounts/models.
+            if _is_unsupported_video_input_error(str(exc)) or _is_request_too_large_error(str(exc)):
                 return await self._analyze_with_keyframes(video_path, reel_url)
             raise
 
@@ -40,9 +45,9 @@ class ClaudeClient:
             'concept, script, requirements, virality, feasibility, recording_time.\n\n'
             'Rules:\n'
             '- requirements must be concise comma-separated assets/needs\n'
-            '- virality should map to High/Medium/Low\n'
-            '- feasibility should map to Easy/Medium/Hard\n'
-            '- recording_time should map to <5 / 5-15 / 15+\n'
+            '- virality must be exactly one of: High, Mid, Low\n'
+            '- feasibility must be exactly one of: Easy, Complex\n'
+            '- recording_time must be exactly one of: <5, 5-10, 10-30\n'
             '- script should be practical and short for recreating video style\n\n'
             f'Reel URL: {reel_url}\n\n'
             'Creator style guide:\n'
@@ -81,55 +86,81 @@ class ClaudeClient:
     async def _analyze_with_keyframes(self, video_path: Path, reel_url: str) -> ClaudeAnalysisResult:
         with tempfile.TemporaryDirectory(prefix='contentgg-frames-') as tmp_dir:
             frame_dir = Path(tmp_dir)
-            frame_paths = _extract_keyframes(video_path, frame_dir, max_frames=6)
-            if not frame_paths:
-                raise ClaudeAnalysisError('Could not extract frames for Claude fallback analysis')
+            profiles = [
+                {'max_frames': 6, 'fps_filter': '1/2', 'scale_width': 720},
+                {'max_frames': 4, 'fps_filter': '1/3', 'scale_width': 640},
+                {'max_frames': 3, 'fps_filter': '1/4', 'scale_width': 480},
+                {'max_frames': 2, 'fps_filter': '1/6', 'scale_width': 360},
+            ]
 
-            content_blocks: list[dict] = []
-            content_blocks.append(
-                {
-                    'type': 'text',
-                    'text': (
-                        'Analyze these keyframes from an Instagram reel and output ONLY JSON with keys: '
-                        'concept, script, requirements, virality, feasibility, recording_time.\\n\\n'
-                        'Rules:\\n'
-                        '- requirements must be concise comma-separated assets/needs\\n'
-                        '- virality should map to High/Medium/Low\\n'
-                        '- feasibility should map to Easy/Medium/Hard\\n'
-                        '- recording_time should map to <5 / 5-15 / 15+\\n'
-                        '- script should be practical and short for recreating video style\\n\\n'
-                        f'Reel URL: {reel_url}\\n\\n'
-                        'Creator style guide:\\n'
-                        f'{self._style_guide_text}'
-                    ),
-                }
-            )
+            last_error: Exception | None = None
+            for profile in profiles:
+                frame_paths = _extract_keyframes(
+                    video_path,
+                    frame_dir,
+                    max_frames=profile['max_frames'],
+                    fps_filter=profile['fps_filter'],
+                    scale_width=profile['scale_width'],
+                )
+                if not frame_paths:
+                    continue
 
-            for frame in frame_paths:
-                encoded = base64.b64encode(frame.read_bytes()).decode('utf-8')
+                content_blocks: list[dict] = []
                 content_blocks.append(
                     {
-                        'type': 'image',
-                        'source': {
-                            'type': 'base64',
-                            'media_type': 'image/jpeg',
-                            'data': encoded,
-                        },
+                        'type': 'text',
+                        'text': (
+                            'Analyze these keyframes from an Instagram reel and output ONLY JSON with keys: '
+                            'concept, script, requirements, virality, feasibility, recording_time.\\n\\n'
+                            'Rules:\\n'
+                            '- requirements must be concise comma-separated assets/needs\\n'
+                            '- virality must be exactly one of: High, Mid, Low\\n'
+                            '- feasibility must be exactly one of: Easy, Complex\\n'
+                            '- recording_time must be exactly one of: <5, 5-10, 10-30\\n'
+                            '- script should be practical and short for recreating video style\\n\\n'
+                            f'Reel URL: {reel_url}\\n\\n'
+                            'Creator style guide:\\n'
+                            f'{self._style_guide_text}'
+                        ),
                     }
                 )
 
-            body = {
-                'model': self._model,
-                'max_tokens': 1400,
-                'temperature': 0.2,
-                'messages': [{'role': 'user', 'content': content_blocks}],
-            }
-            data = await self._request_messages(body)
-            raw_text = _extract_text_from_response(data)
-            try:
-                return parse_and_normalize_analysis(raw_text)
-            except Exception as exc:
-                raise ClaudeAnalysisError(f'Could not normalize Claude output: {exc}') from exc
+                for frame in frame_paths:
+                    encoded = base64.b64encode(frame.read_bytes()).decode('utf-8')
+                    content_blocks.append(
+                        {
+                            'type': 'image',
+                            'source': {
+                                'type': 'base64',
+                                'media_type': 'image/jpeg',
+                                'data': encoded,
+                            },
+                        }
+                    )
+
+                body = {
+                    'model': self._model,
+                    'max_tokens': 1400,
+                    'temperature': 0.2,
+                    'messages': [{'role': 'user', 'content': content_blocks}],
+                }
+                try:
+                    data = await self._request_messages(body)
+                except ClaudeAnalysisError as exc:
+                    if _is_request_too_large_error(str(exc)):
+                        last_error = exc
+                        continue
+                    raise
+
+                raw_text = _extract_text_from_response(data)
+                try:
+                    return parse_and_normalize_analysis(raw_text)
+                except Exception as exc:
+                    raise ClaudeAnalysisError(f'Could not normalize Claude output: {exc}') from exc
+
+            if last_error is not None:
+                raise ClaudeAnalysisError('Claude request too large even after keyframe fallback compression') from last_error
+            raise ClaudeAnalysisError('Could not extract frames for Claude fallback analysis')
 
     async def _request_messages(self, body: dict) -> dict:
         headers = {
@@ -169,7 +200,21 @@ def _is_unsupported_video_input_error(message: str) -> bool:
     )
 
 
-def _extract_keyframes(video_path: Path, output_dir: Path, max_frames: int = 6) -> list[Path]:
+def _is_request_too_large_error(message: str) -> bool:
+    lowered = message.lower()
+    return 'request_too_large' in lowered or 'payload too large' in lowered or '(413)' in lowered
+
+
+def _extract_keyframes(
+    video_path: Path,
+    output_dir: Path,
+    max_frames: int = 6,
+    fps_filter: str = '1/2',
+    scale_width: int = 720,
+) -> list[Path]:
+    for existing in output_dir.glob('frame-*.jpg'):
+        existing.unlink(missing_ok=True)
+
     output_pattern = output_dir / 'frame-%02d.jpg'
     cmd = [
         'ffmpeg',
@@ -179,7 +224,9 @@ def _extract_keyframes(video_path: Path, output_dir: Path, max_frames: int = 6) 
         '-i',
         str(video_path),
         '-vf',
-        'fps=1/2,scale=720:-1',
+        f'fps={fps_filter},scale={scale_width}:-1',
+        '-q:v',
+        '8',
         '-frames:v',
         str(max_frames),
         '-y',

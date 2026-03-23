@@ -36,24 +36,53 @@ class JobWorker:
 
     async def _run_loop(self) -> None:
         while not self._stop_event.is_set():
-            job = await claim_next_job()
+            try:
+                job = await claim_next_job()
+            except Exception:
+                LOGGER.exception('Failed to claim next job')
+                await asyncio.sleep(2)
+                continue
+
             if job is None:
                 await asyncio.sleep(2)
                 continue
 
-            await self._handle_job(job)
+            try:
+                await self._handle_job(job)
+            except Exception:
+                # A final safety net; _handle_job should already absorb failures.
+                LOGGER.exception('Unexpected unhandled worker error for %s', job.reel_url)
+                await asyncio.sleep(1)
 
     async def _handle_job(self, job: JobRecord) -> None:
         try:
             result = await self._processor.process_reel(job.reel_url)
             await mark_saved_reel_processed(job.reel_url, sheet_row=result.row_number)
             await complete_job(job.id)
-            await self._notify_success(job.reel_url, result.action, result.row_number)
+            try:
+                await self._notify_success(job.reel_url, result.action, result.row_number)
+            except Exception:
+                LOGGER.exception('Failed to send success notification for %s', job.reel_url)
         except Exception as exc:
             LOGGER.exception('Job failed for %s', job.reel_url)
-            await mark_saved_reel_error(job.reel_url, str(exc))
-            outcome, attempts = await fail_or_retry_job(job, str(exc))
-            await self._notify_failure(job.reel_url, str(exc), outcome, attempts, job.max_attempts)
+            reason = str(exc)
+            outcome = 'failed'
+            attempts = job.attempts + 1
+
+            try:
+                await mark_saved_reel_error(job.reel_url, reason)
+            except Exception:
+                LOGGER.exception('Failed to mark saved reel error for %s', job.reel_url)
+
+            try:
+                outcome, attempts = await fail_or_retry_job(job, reason)
+            except Exception:
+                LOGGER.exception('Failed to mark job retry/failure for %s', job.reel_url)
+
+            try:
+                await self._notify_failure(job.reel_url, reason, outcome, attempts, job.max_attempts)
+            except Exception:
+                LOGGER.exception('Failed to send failure notification for %s', job.reel_url)
 
     async def _notify_success(self, reel_url: str, action: str, row_number: int) -> None:
         chats = await list_active_chats()
