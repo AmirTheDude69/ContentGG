@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import mimetypes
 import subprocess
@@ -87,10 +88,9 @@ class ClaudeClient:
         with tempfile.TemporaryDirectory(prefix='contentgg-frames-') as tmp_dir:
             frame_dir = Path(tmp_dir)
             profiles = [
-                {'max_frames': 6, 'fps_filter': '1/2', 'scale_width': 720},
-                {'max_frames': 4, 'fps_filter': '1/3', 'scale_width': 640},
-                {'max_frames': 3, 'fps_filter': '1/4', 'scale_width': 480},
-                {'max_frames': 2, 'fps_filter': '1/6', 'scale_width': 360},
+                {'max_frames': 3, 'fps_filter': '1/3', 'scale_width': 480},
+                {'max_frames': 2, 'fps_filter': '1/4', 'scale_width': 360},
+                {'max_frames': 2, 'fps_filter': '1/6', 'scale_width': 320},
             ]
 
             last_error: Exception | None = None
@@ -169,10 +169,17 @@ class ClaudeClient:
             'content-type': 'application/json',
         }
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post('https://api.anthropic.com/v1/messages', headers=headers, json=body)
-        if response.status_code >= 400:
-            raise ClaudeAnalysisError(f'Claude request failed ({response.status_code}): {response.text}')
-        return response.json()
+            for attempt in range(4):
+                response = await client.post('https://api.anthropic.com/v1/messages', headers=headers, json=body)
+                if response.status_code == 429 and attempt < 3:
+                    retry_after = _parse_retry_after_seconds(response.headers.get('retry-after'))
+                    delay = retry_after if retry_after is not None else min(60, 10 * (attempt + 1))
+                    await asyncio.sleep(delay)
+                    continue
+                if response.status_code >= 400:
+                    raise ClaudeAnalysisError(f'Claude request failed ({response.status_code}): {response.text}')
+                return response.json()
+        raise ClaudeAnalysisError('Claude request failed after retries')
 
 
 def _extract_text_from_response(payload: dict) -> str:
@@ -203,6 +210,16 @@ def _is_unsupported_video_input_error(message: str) -> bool:
 def _is_request_too_large_error(message: str) -> bool:
     lowered = message.lower()
     return 'request_too_large' in lowered or 'payload too large' in lowered or '(413)' in lowered
+
+
+def _parse_retry_after_seconds(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    try:
+        seconds = int(raw.strip())
+    except Exception:
+        return None
+    return max(1, min(seconds, 120))
 
 
 def _extract_keyframes(

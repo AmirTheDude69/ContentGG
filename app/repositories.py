@@ -136,7 +136,7 @@ async def fail_or_retry_job(job: JobRecord, error: str) -> tuple[str, int]:
             set status = 'pending',
                 attempts = $2,
                 last_error = left($3, 1000),
-                next_attempt_at = now() + ($4::text || ' minutes')::interval,
+                next_attempt_at = now() + make_interval(mins => $4::int),
                 updated_at = now()
             where id = $1::uuid
             """,
